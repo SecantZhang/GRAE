@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import scipy
+import tqdm
+import math
 
 from grae.data.base_dataset import DEVICE
 from grae.data.base_dataset import FromNumpyDataset
@@ -94,7 +96,7 @@ class AE(BaseModel):
         self.early_stopping_count = 0
         self.write_path = write_path
 
-    def init_torch_module(self, data_shape, vae=False, sigmoid=False):
+    def init_torch_module(self, data_shape, vae=False, sigmoid=False, batch_norm=False):
         """Infer autoencoder architecture (MLP or Convolutional + MLP) from data shape.
 
         Initialize torch module.
@@ -103,8 +105,9 @@ class AE(BaseModel):
             data_shape(tuple[int]): Shape of one sample.
             vae(bool): Make this architecture a VAE.
             sigmoid(bool): Apply sigmoid to decoder output.
-
+            batch_norm: Adding batch norm layers to the encoder output
         """
+        print(f"data shape is {data_shape}, {'conv autoencoder' if data_shape == 3 else 'autoencoder'} case enabled")
         # Infer input size from data. Initialize torch module and optimizer
         if len(data_shape) == 1:
             # Samples are flat vectors. MLP case
@@ -114,7 +117,8 @@ class AE(BaseModel):
                                                   z_dim=self.n_components,
                                                   noise=self.noise,
                                                   vae=vae,
-                                                  sigmoid=sigmoid)
+                                                  sigmoid=sigmoid,
+                                                  batch_norm=batch_norm)
         elif len(data_shape) == 3:
             in_channel, height, width = data_shape
             #  Samples are 3D tensors (i.e. images). Convolutional case.
@@ -168,13 +172,20 @@ class AE(BaseModel):
         # Get first metrics
         self.log_metrics(0)
 
+        loss_report_step = math.ceil(self.epochs / 20)
+        pbar = tqdm.tqdm(total=len(list(range(1, self.epochs+1))), desc="fitting")
         for epoch in range(1, self.epochs + 1):
             # print(f'            Epoch {epoch}...')
+            batch_losses = torch.tensor([], dtype=torch.float32, device=torch.device("cuda"))
             for batch in self.loader:
                 self.optimizer.zero_grad()
-                self.train_body(batch)
+                batch_loss = self.train_body(batch)
+                batch_losses = torch.cat((batch_losses, batch_loss.unsqueeze(0)))
                 self.optimizer.step()
+                pbar.set_description(f"fitting, curr batch loss: {batch_loss}")
 
+            if epoch % loss_report_step == 0:
+                print(f"epoch {epoch}/{self.epochs}: avg loss = {np.mean(batch_losses.tolist())}")
             self.log_metrics(epoch)
             self.end_epoch(epoch)
 
@@ -183,8 +194,11 @@ class AE(BaseModel):
                 if self.comet_exp is not None:
                     self.comet_exp.log_metric('early_stopped',
                                               epoch - self.early_stopping_count)
+                pbar.set_description("fitting: early stopping triggered")
                 break
-
+            pbar.update(1)
+        pbar.close()
+        
         # Load checkpoint if it exists
         checkpoint_path = os.path.join(self.write_path, 'checkpoint.pt')
 
@@ -215,7 +229,7 @@ class AE(BaseModel):
         data = data.to(DEVICE)
 
         x_hat, z = self.torch_module(data)  # Forward pass
-        self.compute_loss(data, x_hat, z, idx)
+        return self.compute_loss(data, x_hat, z, idx)
 
     def compute_loss(self, x, x_hat, z, idx):
         """Apply loss to update parameters following a forward pass.
@@ -225,10 +239,12 @@ class AE(BaseModel):
             x_hat(torch.Tensor): Reconstructed batch (decoder output).
             z(torch.Tensor): Batch embedding (encoder output).
             idx(torch.Tensor): Indices of samples in batch.
-
+        Returns:
+            loss
         """
         loss = self.criterion(x_hat, x)
         loss.backward()
+        return loss
 
     def end_epoch(self, epoch):
         """Method called at the end of every training epoch.
@@ -401,12 +417,12 @@ class GRAEBase(AE):
             x(BaseDataset): Dataset to fit.
 
         """
-        print('       Fitting GRAE...')
-        print('           Fitting manifold learning embedding...')
+        print('Fitting GRAE...')
+        print('    Fitting manifold learning embedding...')
         emb = scipy.stats.zscore(self.embedder.fit_transform(x))  # Normalize embedding
         self.target_embedding = torch.from_numpy(emb).float().to(DEVICE)
 
-        print('           Fitting encoder & decoder...')
+        print('    Fitting encoder & decoder...')
         super().fit(x)
 
     def compute_loss(self, x, x_hat, z, idx):
@@ -425,6 +441,7 @@ class GRAEBase(AE):
             loss = self.criterion(x, x_hat)
 
         loss.backward()
+        return loss
 
     def log_metrics_train(self, epoch):
         """Log train metrics to comet if comet experiment was set.
@@ -490,7 +507,7 @@ class GRAE(GRAEBase):
     manifold learning algorithm.
     """
 
-    def __init__(self, *, lam=100, knn=5, gamma=1, t='auto', relax=False, **kwargs):
+    def __init__(self, *, lam=100, knn=5, gamma=1, t='auto', relax=False, knn_dist="euclidean", **kwargs):
         """Init.
 
         Args:
@@ -509,8 +526,49 @@ class GRAE(GRAEBase):
                                               t=t,
                                               gamma=gamma,
                                               verbose=0,
-                                              n_jobs=-1),
+                                              n_jobs=-1, 
+                                              knn_dist=knn_dist),
                          **kwargs)
+
+
+class GRAE_Strict(GRAEBase):
+    def __init__(self, *, lam=100, knn=5, gamma=1, t='auto', relax=False, knn_dist="euclidean", **kwargs):
+        """Init.
+
+        Args:
+            lam(float): Regularization factor.
+            knn(int): knn argument of PHATE. Number of neighbors to consider in knn graph.
+            t(int): Number of steps of the diffusion operator. Can also be set to 'auto' to select t according to the
+            knee point in the Von Neumann Entropy of the diffusion operator
+            gamma(float): Informational distance.
+            relax(bool): Use the lambda relaxation scheme. Set to false to use constant lambda throughout training.
+            **kwargs: All other kehyword arguments are passed to the GRAEBase parent class.
+        """
+        super().__init__(lam=lam,
+                         relax=relax,
+                         embedder=PHATE,
+                         embedder_params=dict(knn=knn,
+                                              t=t,
+                                              gamma=gamma,
+                                              verbose=0,
+                                              n_jobs=-1,
+                                              knn_dist=knn_dist),
+                         **kwargs)
+
+    def compute_loss(self, x, x_hat, z, idx):
+        """Compute torch-compatible geometric loss, this new loss would not care about the reconstruction errors.
+
+        Args:
+            x(torch.Tensor): Input batch.
+            x_hat(torch.Tensor): Reconstructed batch (decoder output).
+            z(torch.Tensor): Batch embedding (encoder output).
+            idx(torch.Tensor): Indices of samples in batch.
+
+        """
+        loss = self.lam * self.criterion(z, self.target_embedding[idx])
+        loss.backward()
+        return loss
+
 
 
 class GRAE_R(GRAEBase):
@@ -572,7 +630,8 @@ class LargeGRAE(GRAE):
 class GRAEUMAP(GRAEBase):
     """GRAE with UMAP regularization."""
 
-    def __init__(self, *, lam=100, n_neighbors=15, min_dist=.1, relax=False, **kwargs):
+    def __init__(self, *, lam=100, n_neighbors=15, min_dist=.1, relax=False, 
+                 metric="euclidean", output_metric="euclidean", verbose=False, **kwargs):
         """Init.
 
         Args:
@@ -585,9 +644,49 @@ class GRAEUMAP(GRAEBase):
         """
         super().__init__(lam=lam,
                          embedder=UMAP,
-                         embedder_params=dict(n_neighbors=n_neighbors, min_dist=min_dist),
+                         embedder_params=dict(n_neighbors=n_neighbors, min_dist=min_dist,
+                                              metric=metric, output_metric=output_metric, verbose=verbose),
                          relax=relax,
                          **kwargs)
+
+
+class GRAEUMAP_Strict(GRAEBase):
+    """GRAE with UMAP regularization."""
+
+    def __init__(self, *, lam=100, n_neighbors=15, min_dist=.1, relax=False,
+                 metric="euclidean", output_metric="euclidean", verbose=True, **kwargs):
+        """Init.
+
+        Args:
+            lam(float): Regularization factor.
+            n_neighbors(int): The size of local neighborhood (in terms of number of neighboring sample points) used for
+            manifold approximation.
+            min_dist(float):  The effective minimum distance between embedded points.
+            relax(bool): Use the lambda relaxation scheme. Set to false to use constant lambda throughout training.
+            metric: parameter used in the UMAP embedder, can be string or callable function
+            output_metric: parameter used in the UMAP embedder, can be string or callable function
+            **kwargs: All other arguments with keys are passed to the GRAEBase parent class.
+        """
+        super().__init__(lam=lam,
+                         embedder=UMAP,
+                         embedder_params=dict(n_neighbors=n_neighbors, min_dist=min_dist,
+                                              metric=metric, output_metric=output_metric, verbose=verbose),
+                         relax=relax,
+                         **kwargs)
+
+    def compute_loss(self, x, x_hat, z, idx):
+        """Compute torch-compatible geometric loss, this new loss would not care about the reconstruction errors.
+
+        Args:
+            x(torch.Tensor): Input batch.
+            x_hat(torch.Tensor): Reconstructed batch (decoder output).
+            z(torch.Tensor): Batch embedding (encoder output).
+            idx(torch.Tensor): Indices of samples in batch.
+
+        """
+        loss = self.lam * self.criterion(z, self.target_embedding[idx])
+        loss.backward()
+        return loss
 
 
 class GRAEUMAP_R(GRAEBase):

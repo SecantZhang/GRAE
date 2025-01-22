@@ -134,7 +134,7 @@ class UMAP(BaseModel):
     """
 
     def __init__(self, random_state=SEED, proc_threshold=PROC_THRESHOLD, procrustes_batch_size=PROC_BATCH_SIZE,
-                 procrustes_lm=PROC_LM, **kwargs):
+                 procrustes_lm=PROC_LM, metric="euclidean", output_metric="euclidean", verbose=True, **kwargs):
         """Init.
 
         Args:
@@ -147,7 +147,10 @@ class UMAP(BaseModel):
             **kwargs: Any remaining keyword arguments are passed to the UMAP estimator.
         """
         super().__init__()
-        self.umap_estimator = umap.UMAP(random_state=random_state, **kwargs)
+        # self.umap_estimator = umap.UMAP(random_state=random_state, **kwargs)
+        self.umap_estimator = umap.UMAP(metric=metric, output_metric=output_metric, verbose=verbose, **kwargs) # no random seed to enable parallelism
+        self.metric = metric
+        self.output_metric = output_metric
         self.estimator = None
         self.data_shape = None
         self.proc_threshold = proc_threshold

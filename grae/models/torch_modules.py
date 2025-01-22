@@ -56,7 +56,7 @@ class MLP(nn.Sequential):
 class AutoencoderModule(nn.Module):
     """Vanilla Autoencoder torch module"""
 
-    def __init__(self, input_dim, hidden_dims, z_dim, noise=0, vae=False, sigmoid=False):
+    def __init__(self, input_dim, hidden_dims, z_dim, noise=0, vae=False, sigmoid=False, batch_norm=False):
         """Init.
 
         Args:
@@ -74,6 +74,7 @@ class AutoencoderModule(nn.Module):
 
         # Double the size of the latent space if vae to model both mu and logvar
         full_list = [input_dim] + list(hidden_dims) + [z_dim * 2 if vae else z_dim]
+        self.layer_size_list = full_list
 
         self.encoder = MLP(dim_list=full_list)
 
@@ -82,6 +83,8 @@ class AutoencoderModule(nn.Module):
 
         self.decoder = MLP(dim_list=full_list, sigmoid=sigmoid)
         self.noise = noise
+        self.batch_norm = batch_norm
+        self.batch_norm_layer = nn.BatchNorm1d(z_dim)  # ensuring the batch norm layer produces same amount dims
 
     def forward(self, x):
         """Forward pass.
@@ -96,6 +99,8 @@ class AutoencoderModule(nn.Module):
 
         """
         z = self.encoder(x)
+        if self.batch_norm:  # apply batch normlization to avoid the vanishing gradient problem when training
+            z = self.batch_norm_layer(z)
 
         # Old idea to inject noise in latent space. Currently not used.
         if self.noise > 0:

@@ -4,6 +4,7 @@ import numpy as np
 from numba import njit
 from numba.types import float32 as nb_float32, Array
 from typing import Union
+import torch
 
 
 @njit
@@ -80,6 +81,9 @@ def sbd(x, y):
 
 @njit((Array(nb_float32, 1, 'C'), Array(nb_float32, 1, 'C')), nopython=True)
 def sbd_1d(x, y): 
+    # Ensure both arrays are writable
+    x = x.copy()
+    y = y.copy()
     return sbd(x.reshape(-1, x.shape[0]), y.reshape(-1, y.shape[0]))
 
 
@@ -91,6 +95,12 @@ def print_list(li: Union[list, np.ndarray]) -> None:
 
 
 if __name__ == "__main__":
+    torch.manual_seed(0)
+    batch_s1 = torch.rand(10, 32).numpy().astype(np.float32)  # 10 sequences of length 32
+    batch_s2 = torch.rand(10, 32).numpy().astype(np.float32)
+    for b in range(10):
+        print(sbd_1d(batch_s1[b], batch_s2[b]))
+
     np.random.seed(0)
     n, m = 3, 32
     test_size = 100
